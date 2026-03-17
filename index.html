@@ -445,11 +445,13 @@
   let currentIdx = 0;
   let isPlaying = false;
   let isPaused = false;
+  let activeText = ""; // To track if user changes text while paused
 
   textInput.addEventListener('input', () => {
     charCount.textContent = textInput.value.length.toLocaleString();
   });
 
+  // Slider visual updates
   rateSlider.addEventListener('input', () => {
     rateVal.textContent = parseFloat(rateSlider.value).toFixed(1) + '×';
     localStorage.setItem('listener_rate', rateSlider.value);
@@ -459,7 +461,17 @@
     localStorage.setItem('listener_pitch', pitchSlider.value);
   });
 
-  // Restore saved rate/pitch immediately (before voices load)
+  // Apply slider changes to the currently reading sentence on release
+  const updateActivePlayback = () => {
+    if (isPlaying && !isPaused) {
+      synth.cancel();
+      speakFrom(currentIdx);
+    }
+  };
+  rateSlider.addEventListener('change', updateActivePlayback);
+  pitchSlider.addEventListener('change', updateActivePlayback);
+
+  // Restore saved rate/pitch immediately
   const savedRate = localStorage.getItem('listener_rate');
   const savedPitch = localStorage.getItem('listener_pitch');
   if (savedRate) { rateSlider.value = savedRate; rateVal.textContent = parseFloat(savedRate).toFixed(1) + '×'; }
@@ -468,6 +480,7 @@
   voiceSelect.addEventListener('change', () => {
     const vi = parseInt(voiceSelect.value);
     if (!isNaN(vi) && voices[vi]) localStorage.setItem('listener_voice', voices[vi].name);
+    updateActivePlayback();
   });
 
   let voicesReady = false;
@@ -496,7 +509,6 @@
       voiceSelect.appendChild(opt);
     });
 
-    // Restore saved voice by name
     const savedVoice = localStorage.getItem('listener_voice');
     if (savedVoice) {
       const match = sorted.findIndex(v => v.name === savedVoice);
@@ -505,9 +517,6 @@
     return true;
   }
 
-  // Chrome loads voices async; Safari fires onvoiceschanged; Firefox has them sync.
-  // Try immediately, then poll, and also hook onvoiceschanged — whichever fires first wins.
-  // populateVoices() is guarded by voicesReady so it only runs once.
   populateVoices(synth.getVoices());
   if (synth.onvoiceschanged !== undefined) {
     synth.onvoiceschanged = () => populateVoices(synth.getVoices());
@@ -520,40 +529,49 @@
     if (pollCount > 20) clearInterval(voicePoll);
   }, 200);
 
-  // Chrome desktop silently fails on utterances longer than ~200 chars.
-  // We split at sentence boundaries first, then hard-cap at 160 chars on word boundaries.
   const CHROME_SAFE_LEN = 160;
 
+  // Cross-browser safe sentence splitting (No Lookbehinds)
   function splitSentences(text) {
     text = text.trim();
     if (!text) return [];
 
-    // Split on sentence-ending punctuation followed by whitespace + capital, or paragraph breaks
-    const raw = text.split(/(?<=[.!?…])\s+(?=[A-Z"'\u201C])|(?<=[.!?…]["'\u201D])\s+(?=[A-Z])|[\r\n]{2,}/);
+    // Split on typical sentence enders (. ! ? …) followed by space/newline, OR double newlines.
+    // We capture the delimiters to reconstruct them.
+    const rawParts = text.split(/([.!?\u2026]+[\s\n]+|[\r\n]{2,})/g);
     const chunks = [];
+    let current = '';
 
-    raw.forEach(chunk => {
-      const c = chunk.trim();
-      if (!c) return;
-      if (c.length <= CHROME_SAFE_LEN) {
-        chunks.push(c);
-      } else {
-        // Break long sentences on word boundaries under the limit
-        const words = c.split(' ');
-        let current = '';
-        words.forEach(word => {
-          const candidate = current ? current + ' ' + word : word;
-          if (candidate.length > CHROME_SAFE_LEN && current) {
-            chunks.push(current);
-            current = word;
+    for (let i = 0; i < rawParts.length; i++) {
+      let part = rawParts[i];
+      if (!part) continue;
+      current += part;
+
+      // If this part is a delimiter OR it's the very last part of the string
+      if (/([.!?\u2026]+[\s\n]+|[\r\n]{2,})/.test(part) || i === rawParts.length - 1) {
+        let cleanChunk = current.trim();
+        if (cleanChunk) {
+          if (cleanChunk.length <= CHROME_SAFE_LEN) {
+            chunks.push(cleanChunk);
           } else {
-            current = candidate;
+            // Hard break long chunks on word boundaries
+            const words = cleanChunk.split(' ');
+            let temp = '';
+            words.forEach(word => {
+              const candidate = temp ? temp + ' ' + word : word;
+              if (candidate.length > CHROME_SAFE_LEN && temp) {
+                chunks.push(temp);
+                temp = word;
+              } else {
+                temp = candidate;
+              }
+            });
+            if (temp) chunks.push(temp);
           }
-        });
-        if (current) chunks.push(current);
+        }
+        current = ''; // Reset for next sentence
       }
-    });
-
+    }
     return chunks.length ? chunks : [text];
   }
 
@@ -589,31 +607,12 @@
     btnPause.textContent = paused ? '▶ Resume' : '⏸ Pause';
   }
 
-  // Chrome desktop stops speech after ~15s if the utterance queue goes idle.
-  // Workaround: resume() the synth periodically while playing.
-  let keepAliveTimer = null;
-
-  function startKeepAlive() {
-    stopKeepAlive();
-    keepAliveTimer = setInterval(() => {
-      if (isPlaying && !isPaused && synth.speaking) {
-        synth.pause();
-        synth.resume();
-      }
-    }, 10000);
-  }
-
-  function stopKeepAlive() {
-    if (keepAliveTimer) { clearInterval(keepAliveTimer); keepAliveTimer = null; }
-  }
-
   function makeUtterance(text) {
     const utter = new SpeechSynthesisUtterance(text);
     utter.rate = parseFloat(rateSlider.value);
     utter.pitch = parseFloat(pitchSlider.value);
     const vi = parseInt(voiceSelect.value);
     if (!isNaN(vi) && voices[vi]) {
-      // Always do a fresh lookup by name — stale voice object references can fail on Safari/Chrome
       const voiceName = voices[vi].name;
       const fresh = synth.getVoices().find(v => v.name === voiceName);
       utter.voice = fresh || voices[vi];
@@ -625,7 +624,6 @@
     if (idx >= sentences.length) {
       isPlaying = false;
       isPaused = false;
-      stopKeepAlive();
       currentIdx = sentences.length;
       progressFill.style.width = '100%';
       pctEl.textContent = 100;
@@ -652,7 +650,8 @@
     utter.onend = advance;
 
     utter.onerror = (e) => {
-      if (e.error === 'interrupted' || e.error === 'canceled') return;
+      // If we manually canceled (e.g. Stop, slider change), just halt advancement
+      if (e.error === 'interrupted' || e.error === 'canceled') return; 
       if (e.error === 'synthesis-failed' && !didEnd) {
         didEnd = true;
         setTimeout(() => {
@@ -670,20 +669,10 @@
     synth.speak(utter);
   }
 
-  btnPlay.addEventListener('click', () => {
-    const text = textInput.value.trim();
-    if (!text) { textInput.focus(); return; }
-
-    if (isPaused) {
-      isPaused = false;
-      isPlaying = true;
-      synth.resume();
-      setStatus('reading');
-      setButtonState(true, false);
-      return;
-    }
-
+  function startPlayback() {
     synth.cancel();
+    const text = textInput.value.trim();
+    activeText = text;
     sentences = splitSentences(text);
     currentIdx = 0;
     isPlaying = true;
@@ -695,10 +684,7 @@
     readingDisplay.innerHTML = '';
     setStatus('reading');
     setButtonState(true, false);
-    startKeepAlive();
 
-    // On desktop Chrome, voices may not be ready immediately on first click.
-    // Wait up to 1s for them to load before speaking.
     if (!voicesReady) {
       let waited = 0;
       const waitForVoices = setInterval(() => {
@@ -710,15 +696,41 @@
     } else {
       speakFrom(0);
     }
+  }
+
+  btnPlay.addEventListener('click', () => {
+    const text = textInput.value.trim();
+    if (!text) { textInput.focus(); return; }
+
+    if (isPaused) {
+      // Check if user altered the text while paused
+      if (text !== activeText) {
+        startPlayback();
+      } else {
+        isPaused = false;
+        synth.resume();
+        setStatus('reading');
+        setButtonState(true, false);
+      }
+      return;
+    }
+
+    startPlayback();
   });
 
   btnPause.addEventListener('click', () => {
     if (!isPlaying) return;
     if (isPaused) {
-      isPaused = false;
-      synth.resume();
-      setStatus('reading');
-      setButtonState(true, false);
+      const text = textInput.value.trim();
+      // Handle edge case of editing text then clicking "Resume"
+      if (text !== activeText) {
+        startPlayback();
+      } else {
+        isPaused = false;
+        synth.resume();
+        setStatus('reading');
+        setButtonState(true, false);
+      }
     } else {
       isPaused = true;
       synth.pause();
@@ -731,7 +743,6 @@
     synth.cancel();
     isPlaying = false;
     isPaused = false;
-    stopKeepAlive();
     setStatus('paused');
     setButtonState(false, false);
     btnRestart.disabled = false;
@@ -739,17 +750,10 @@
   });
 
   btnRestart.addEventListener('click', () => {
-    synth.cancel();
-    isPlaying = true;
-    isPaused = false;
-    currentIdx = 0;
-    setStatus('reading');
-    setButtonState(true, false);
-    startKeepAlive();
-    speakFrom(0);
+    startPlayback();
   });
 
-  window.addEventListener('beforeunload', () => { synth.cancel(); stopKeepAlive(); });
+  window.addEventListener('beforeunload', () => { synth.cancel(); });
 </script>
 </body>
 </html>
