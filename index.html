@@ -474,8 +474,8 @@
 
   function populateVoices(list) {
     if (!list.length) return false;
+    if (voicesReady) return true;
     voicesReady = true;
-    voices = list;
     voiceSelect.innerHTML = '';
     const preferred = ['Samantha', 'Google UK English Female', 'Karen', 'Moira', 'Daniel', 'Google US English'];
     const sorted = [...list].sort((a, b) => {
@@ -505,16 +505,12 @@
     return true;
   }
 
-  function loadVoices() {
-    const list = synth.getVoices();
-    if (populateVoices(list)) return;
-  }
-
-  // Chrome desktop: voices load asynchronously and onvoiceschanged fires late or not at all.
-  // Poll with increasing intervals until voices appear, max ~4 seconds.
-  loadVoices();
+  // Chrome loads voices async; Safari fires onvoiceschanged; Firefox has them sync.
+  // Try immediately, then poll, and also hook onvoiceschanged — whichever fires first wins.
+  // populateVoices() is guarded by voicesReady so it only runs once.
+  populateVoices(synth.getVoices());
   if (synth.onvoiceschanged !== undefined) {
-    synth.onvoiceschanged = loadVoices;
+    synth.onvoiceschanged = () => populateVoices(synth.getVoices());
   }
   let pollCount = 0;
   const voicePoll = setInterval(() => {
@@ -616,7 +612,12 @@
     utter.rate = parseFloat(rateSlider.value);
     utter.pitch = parseFloat(pitchSlider.value);
     const vi = parseInt(voiceSelect.value);
-    if (!isNaN(vi) && voices[vi]) utter.voice = voices[vi];
+    if (!isNaN(vi) && voices[vi]) {
+      // Always do a fresh lookup by name — stale voice object references can fail on Safari/Chrome
+      const voiceName = voices[vi].name;
+      const fresh = synth.getVoices().find(v => v.name === voiceName);
+      utter.voice = fresh || voices[vi];
+    }
     return utter;
   }
 
@@ -689,6 +690,9 @@
     isPaused = false;
 
     progressSection.classList.add('active');
+    progressFill.style.width = '0%';
+    pctEl.textContent = '0';
+    readingDisplay.innerHTML = '';
     setStatus('reading');
     setButtonState(true, false);
     startKeepAlive();
