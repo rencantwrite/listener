@@ -450,15 +450,35 @@
     charCount.textContent = textInput.value.length.toLocaleString();
   });
 
-  rateSlider.addEventListener('input', () => { rateVal.textContent = parseFloat(rateSlider.value).toFixed(1) + '×'; });
-  pitchSlider.addEventListener('input', () => { pitchVal.textContent = parseFloat(pitchSlider.value).toFixed(1); });
+  rateSlider.addEventListener('input', () => {
+    rateVal.textContent = parseFloat(rateSlider.value).toFixed(1) + '×';
+    localStorage.setItem('listener_rate', rateSlider.value);
+  });
+  pitchSlider.addEventListener('input', () => {
+    pitchVal.textContent = parseFloat(pitchSlider.value).toFixed(1);
+    localStorage.setItem('listener_pitch', pitchSlider.value);
+  });
 
-  function loadVoices() {
-    voices = synth.getVoices();
-    if (!voices.length) return;
+  // Restore saved rate/pitch immediately (before voices load)
+  const savedRate = localStorage.getItem('listener_rate');
+  const savedPitch = localStorage.getItem('listener_pitch');
+  if (savedRate) { rateSlider.value = savedRate; rateVal.textContent = parseFloat(savedRate).toFixed(1) + '×'; }
+  if (savedPitch) { pitchSlider.value = savedPitch; pitchVal.textContent = parseFloat(savedPitch).toFixed(1); }
+
+  voiceSelect.addEventListener('change', () => {
+    const vi = parseInt(voiceSelect.value);
+    if (!isNaN(vi) && voices[vi]) localStorage.setItem('listener_voice', voices[vi].name);
+  });
+
+  let voicesReady = false;
+
+  function populateVoices(list) {
+    if (!list.length) return false;
+    voicesReady = true;
+    voices = list;
     voiceSelect.innerHTML = '';
     const preferred = ['Samantha', 'Google UK English Female', 'Karen', 'Moira', 'Daniel', 'Google US English'];
-    voices.sort((a, b) => {
+    const sorted = [...list].sort((a, b) => {
       const ai = preferred.findIndex(p => a.name.includes(p));
       const bi = preferred.findIndex(p => b.name.includes(p));
       if (ai !== -1 && bi !== -1) return ai - bi;
@@ -468,32 +488,76 @@
       if (!a.lang.startsWith('en') && b.lang.startsWith('en')) return 1;
       return a.name.localeCompare(b.name);
     });
-    voices.forEach((v, i) => {
+    voices = sorted;
+    sorted.forEach((v, i) => {
       const opt = document.createElement('option');
       opt.value = i;
       opt.textContent = v.name + (v.lang ? '  (' + v.lang + ')' : '');
       voiceSelect.appendChild(opt);
     });
+
+    // Restore saved voice by name
+    const savedVoice = localStorage.getItem('listener_voice');
+    if (savedVoice) {
+      const match = sorted.findIndex(v => v.name === savedVoice);
+      if (match !== -1) voiceSelect.value = match;
+    }
+    return true;
   }
 
+  function loadVoices() {
+    const list = synth.getVoices();
+    if (populateVoices(list)) return;
+  }
+
+  // Chrome desktop: voices load asynchronously and onvoiceschanged fires late or not at all.
+  // Poll with increasing intervals until voices appear, max ~4 seconds.
   loadVoices();
-  if (synth.onvoiceschanged !== undefined) synth.onvoiceschanged = loadVoices;
+  if (synth.onvoiceschanged !== undefined) {
+    synth.onvoiceschanged = loadVoices;
+  }
+  let pollCount = 0;
+  const voicePoll = setInterval(() => {
+    pollCount++;
+    const list = synth.getVoices();
+    if (list.length) { populateVoices(list); clearInterval(voicePoll); return; }
+    if (pollCount > 20) clearInterval(voicePoll);
+  }, 200);
+
+  // Chrome desktop silently fails on utterances longer than ~200 chars.
+  // We split at sentence boundaries first, then hard-cap at 160 chars on word boundaries.
+  const CHROME_SAFE_LEN = 160;
 
   function splitSentences(text) {
     text = text.trim();
     if (!text) return [];
+
+    // Split on sentence-ending punctuation followed by whitespace + capital, or paragraph breaks
+    const raw = text.split(/(?<=[.!?…])\s+(?=[A-Z"'\u201C])|(?<=[.!?…]["'\u201D])\s+(?=[A-Z])|[\r\n]{2,}/);
     const chunks = [];
-    const raw = text.split(/(?<=[.!?…"'"])\s+(?=[A-Z"'"])|(?<=\n)\n+/);
+
     raw.forEach(chunk => {
       const c = chunk.trim();
       if (!c) return;
-      if (c.length > 250) {
-        const sub = c.match(/.{1,250}(\s|$)/g) || [c];
-        sub.forEach(s => { if (s.trim()) chunks.push(s.trim()); });
-      } else {
+      if (c.length <= CHROME_SAFE_LEN) {
         chunks.push(c);
+      } else {
+        // Break long sentences on word boundaries under the limit
+        const words = c.split(' ');
+        let current = '';
+        words.forEach(word => {
+          const candidate = current ? current + ' ' + word : word;
+          if (candidate.length > CHROME_SAFE_LEN && current) {
+            chunks.push(current);
+            current = word;
+          } else {
+            current = candidate;
+          }
+        });
+        if (current) chunks.push(current);
       }
     });
+
     return chunks.length ? chunks : [text];
   }
 
@@ -529,10 +593,38 @@
     btnPause.textContent = paused ? '▶ Resume' : '⏸ Pause';
   }
 
+  // Chrome desktop stops speech after ~15s if the utterance queue goes idle.
+  // Workaround: resume() the synth periodically while playing.
+  let keepAliveTimer = null;
+
+  function startKeepAlive() {
+    stopKeepAlive();
+    keepAliveTimer = setInterval(() => {
+      if (isPlaying && !isPaused && synth.speaking) {
+        synth.pause();
+        synth.resume();
+      }
+    }, 10000);
+  }
+
+  function stopKeepAlive() {
+    if (keepAliveTimer) { clearInterval(keepAliveTimer); keepAliveTimer = null; }
+  }
+
+  function makeUtterance(text) {
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.rate = parseFloat(rateSlider.value);
+    utter.pitch = parseFloat(pitchSlider.value);
+    const vi = parseInt(voiceSelect.value);
+    if (!isNaN(vi) && voices[vi]) utter.voice = voices[vi];
+    return utter;
+  }
+
   function speakFrom(idx) {
     if (idx >= sentences.length) {
       isPlaying = false;
       isPaused = false;
+      stopKeepAlive();
       currentIdx = sentences.length;
       progressFill.style.width = '100%';
       pctEl.textContent = 100;
@@ -545,20 +637,33 @@
     currentIdx = idx;
     updateProgress();
 
-    const utter = new SpeechSynthesisUtterance(sentences[idx]);
-    utter.rate = parseFloat(rateSlider.value);
-    utter.pitch = parseFloat(pitchSlider.value);
-    const vi = parseInt(voiceSelect.value);
-    if (!isNaN(vi) && voices[vi]) utter.voice = voices[vi];
+    const utter = makeUtterance(sentences[idx]);
+    let didEnd = false;
 
-    utter.onend = () => {
-      if (isPlaying && !isPaused) speakFrom(idx + 1);
+    const advance = () => {
+      if (didEnd) return;
+      didEnd = true;
+      if (isPlaying && !isPaused) {
+        setTimeout(() => speakFrom(idx + 1), 50);
+      }
     };
+
+    utter.onend = advance;
 
     utter.onerror = (e) => {
       if (e.error === 'interrupted' || e.error === 'canceled') return;
-      console.warn('Speech error:', e.error);
-      if (isPlaying) speakFrom(idx + 1);
+      if (e.error === 'synthesis-failed' && !didEnd) {
+        didEnd = true;
+        setTimeout(() => {
+          if (!isPlaying || isPaused) return;
+          const retry = makeUtterance(sentences[idx]);
+          retry.onend = () => { if (isPlaying && !isPaused) setTimeout(() => speakFrom(idx + 1), 50); };
+          retry.onerror = () => { if (isPlaying && !isPaused) setTimeout(() => speakFrom(idx + 1), 50); };
+          synth.speak(retry);
+        }, 300);
+        return;
+      }
+      advance();
     };
 
     synth.speak(utter);
@@ -586,7 +691,21 @@
     progressSection.classList.add('active');
     setStatus('reading');
     setButtonState(true, false);
-    speakFrom(0);
+    startKeepAlive();
+
+    // On desktop Chrome, voices may not be ready immediately on first click.
+    // Wait up to 1s for them to load before speaking.
+    if (!voicesReady) {
+      let waited = 0;
+      const waitForVoices = setInterval(() => {
+        waited += 100;
+        const list = synth.getVoices();
+        if (list.length) { populateVoices(list); clearInterval(waitForVoices); speakFrom(0); return; }
+        if (waited >= 1000) { clearInterval(waitForVoices); speakFrom(0); }
+      }, 100);
+    } else {
+      speakFrom(0);
+    }
   });
 
   btnPause.addEventListener('click', () => {
@@ -608,6 +727,7 @@
     synth.cancel();
     isPlaying = false;
     isPaused = false;
+    stopKeepAlive();
     setStatus('paused');
     setButtonState(false, false);
     btnRestart.disabled = false;
@@ -621,10 +741,11 @@
     currentIdx = 0;
     setStatus('reading');
     setButtonState(true, false);
+    startKeepAlive();
     speakFrom(0);
   });
 
-  window.addEventListener('beforeunload', () => synth.cancel());
+  window.addEventListener('beforeunload', () => { synth.cancel(); stopKeepAlive(); });
 </script>
 </body>
 </html>
